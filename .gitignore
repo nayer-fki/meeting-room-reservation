@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+venv/
+*.env
+
+# Node.js (React)
+node_modules/
+dist/
+build/
+
+# Docker
+*.log
+
+# IDEs
+.vscode/
+.idea/
+
+# Misc
+*.DS_Store
