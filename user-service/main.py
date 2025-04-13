@@ -1,11 +1,16 @@
 from fastapi import FastAPI, Request, HTTPException, responses
 from authlib.integrations.starlette_client import OAuth
-from starlette.config import Config
-from starlette.middleware.sessions import SessionMiddleware
+from starlette.middleware.sessions import SessionMiddleware  # Add this import
 import os
 import logging
 import secrets
 import httpx
+import jwt
+from datetime import datetime, timedelta
+from kafka import KafkaProducer
+import json
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -14,15 +19,43 @@ logger = logging.getLogger(__name__)
 # Initialize FastAPI app
 app = FastAPI()
 
-# Load environment variables from .env
-config = Config('.env')
-oauth = OAuth(config)
+# Add SessionMiddleware with a secret key
+app.add_middleware(SessionMiddleware, secret_key=secrets.token_hex(32))
 
-# Register Google OAuth (still needed for authorize_redirect)
+# Load environment variables
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
+if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
+    raise ValueError("GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET must be set in environment variables")
+
+# JWT Secret (read from environment variables)
+JWT_SECRET = os.getenv("JWT_SECRET")
+if not JWT_SECRET:
+    raise ValueError("JWT_SECRET must be set in environment variables")
+logger.info(f"Using JWT_SECRET: {JWT_SECRET}")
+JWT_ALGORITHM = "HS256"
+
+# Kafka Producer
+KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
+producer = KafkaProducer(
+    bootstrap_servers=[KAFKA_BOOTSTRAP_SERVERS],
+    value_serializer=lambda v: json.dumps(v).encode('utf-8')
+)
+
+# PostgreSQL connection
+def get_db_connection():
+    conn = psycopg2.connect(
+        os.getenv("DATABASE_URL"),
+        cursor_factory=RealDictCursor
+    )
+    return conn
+
+# Register Google OAuth
+oauth = OAuth()
 oauth.register(
     name='google',
-    client_id=config('GOOGLE_CLIENT_ID'),
-    client_secret=config('GOOGLE_CLIENT_SECRET'),
+    client_id=GOOGLE_CLIENT_ID,
+    client_secret=GOOGLE_CLIENT_SECRET,
     authorize_url='https://accounts.google.com/o/oauth2/auth',
     access_token_url='https://accounts.google.com/o/oauth2/token',
     userinfo_endpoint='https://www.googleapis.com/oauth2/v3/userinfo',
@@ -31,57 +64,40 @@ oauth.register(
     redirect_uri='http://localhost:8001/auth'
 )
 
-# Add session middleware with a strong secret key, lax same-site policy, and secure settings
-app.add_middleware(
-    SessionMiddleware,
-    secret_key=secrets.token_hex(32),
-    same_site='lax',
-    https_only=False,  # Set to True in production with HTTPS
-    max_age=86400  # 24 hours
-)
-
 @app.get("/login")
 async def login(request: Request):
-    # Check if user is already logged in
-    if request.session.get('user'):
-        return responses.RedirectResponse(url='/users/me')
-    
     redirect_uri = "http://localhost:8001/auth"
-    # Generate a state and store it in the session
     state = secrets.token_hex(16)
-    request.session['oauth_state'] = state
-    logger.info(f"Generated state for login: {state}")
-    logger.info(f"Session after setting state: {request.session}")
-    return await oauth.google.authorize_redirect(request, redirect_uri, state=state)
+    logger.info(f"Generated state: {state}")
+    response = await oauth.google.authorize_redirect(request, redirect_uri, state=state)
+    response.set_cookie(key="oauth_state", value=state, httponly=True, samesite="lax", max_age=3600)
+    logger.info(f"Set oauth_state cookie with value: {state}")
+    return response
 
 @app.get("/auth")
 async def auth(request: Request):
     try:
-        # Log request headers to debug duplicate requests
-        logger.info(f"Request headers: {dict(request.headers)}")
-
-        # Log the state from the request and session
+        # Get state from cookie
         state_from_request = request.query_params.get('state')
-        state_from_session = request.session.get('oauth_state')
+        state_from_cookie = request.cookies.get('oauth_state')
         logger.info(f"State from request: {state_from_request}")
-        logger.info(f"State from session: {state_from_session}")
-        logger.info(f"Session in auth: {request.session}")
+        logger.info(f"State from cookie: {state_from_cookie}")
         logger.info(f"Full query params: {request.query_params}")
+        logger.info(f"All cookies: {request.cookies}")
 
-        # Validate state
-        if not state_from_request or not state_from_session:
+        if not state_from_request or not state_from_cookie:
             raise HTTPException(status_code=400, detail="State missing: CSRF warning")
-        if state_from_request != state_from_session:
+        if state_from_request != state_from_cookie:
             raise HTTPException(status_code=400, detail="State mismatch: CSRF warning")
 
-        # Manually fetch the token
+        # Fetch the token
         code = request.query_params.get('code')
         if not code:
             raise HTTPException(status_code=400, detail="No code provided in callback")
 
         token_url = "https://accounts.google.com/o/oauth2/token"
-        client_id = config('GOOGLE_CLIENT_ID')
-        client_secret = config('GOOGLE_CLIENT_SECRET')
+        client_id = GOOGLE_CLIENT_ID
+        client_secret = GOOGLE_CLIENT_SECRET
         redirect_uri = "http://localhost:8001/auth"
 
         logger.info("Manually fetching access token...")
@@ -100,7 +116,7 @@ async def auth(request: Request):
             token = response.json()
         logger.info(f"Received token: {token}")
 
-        # Manually fetch user info using the access token
+        # Fetch user info
         userinfo_endpoint = "https://www.googleapis.com/oauth2/v3/userinfo"
         logger.info("Manually fetching user info...")
         async with httpx.AsyncClient() as client:
@@ -112,33 +128,86 @@ async def auth(request: Request):
             user = response.json()
         logger.info(f"Received user info: {user}")
 
-        # Store user info in session
-        request.session['user'] = dict(user)
-        # Clear the state from session after successful auth
-        request.session.pop('oauth_state', None)
-        return responses.RedirectResponse(url='/users/me')
+        # Store user in PostgreSQL
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                """
+                INSERT INTO users (sub, email, name, picture)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (sub) DO UPDATE
+                SET email = EXCLUDED.email,
+                    name = EXCLUDED.name,
+                    picture = EXCLUDED.picture
+                RETURNING id
+                """,
+                (user["sub"], user["email"], user["name"], user.get("picture"))
+            )
+            user_id = cursor.fetchone()['id']
+            conn.commit()
+        except Exception as e:
+            logger.error(f"Error storing user in database: {str(e)}")
+            raise HTTPException(status_code=500, detail="Failed to store user")
+        finally:
+            cursor.close()
+            conn.close()
+
+        # Generate JWT
+        payload = {
+            "sub": user["sub"],
+            "email": user["email"],
+            "name": user["name"],
+            "exp": datetime.utcnow() + timedelta(hours=24)
+        }
+        jwt_token = jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+        user["token"] = jwt_token
+
+        # Publish user_authenticated event to Kafka
+        user_event = {
+            "event_type": "user_authenticated",
+            "user_id": user["sub"],
+            "email": user["email"],
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        producer.send('user-events', user_event)
+        producer.flush()
+        logger.info(f"Published user_authenticated event: {user_event}")
+
+        # Set JWT in a cookie
+        response = responses.RedirectResponse(url='/users/me')
+        response.set_cookie(key="jwt_token", value=jwt_token, httponly=True, samesite="lax", max_age=86400)
+        response.delete_cookie("oauth_state")
+        return response
     except Exception as e:
         logger.error(f"Authentication error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Authentication error: {str(e)}")
 
 @app.get("/users/me")
 async def get_current_user(request: Request):
-    user = request.session.get('user')
-    if not user:
+    jwt_token = request.cookies.get("jwt_token")
+    if not jwt_token:
         return {"message": "Not logged in"}
-    return {"user": user}
+    try:
+        payload = jwt.decode(jwt_token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT sub, email, name, picture FROM users WHERE sub = %s", (payload["sub"],))
+        user = cursor.fetchone()
+        if not user:
+            return {"message": "User not found"}
+        # Convert RealDictRow to a regular dict and add the token
+        user_dict = dict(user)
+        user_dict["token"] = jwt_token
+        return {"user": user_dict}
+    except Exception as e:
+        logger.error(f"Error fetching user: {str(e)}")
+        return {"message": "Invalid token"}
+    finally:
+        cursor.close()
+        conn.close()
+        
 
-@app.get("/test-session")
-async def test_session(request: Request):
-    # Test session persistence
-    request.session['test'] = 'session-working'
-    logger.info(f"Set test session: {request.session}")
-    return {"message": "Session test set", "session": dict(request.session)}
-
-@app.get("/check-session")
-async def check_session(request: Request):
-    logger.info(f"Check session: {request.session}")
-    return {"message": "Session check", "session": dict(request.session)}
 
 @app.get("/favicon.ico")
 async def favicon():
