@@ -1,6 +1,6 @@
 from fastapi import FastAPI, Request, HTTPException, responses
 from authlib.integrations.starlette_client import OAuth
-from starlette.middleware.sessions import SessionMiddleware  # Add this import
+from starlette.middleware.sessions import SessionMiddleware
 import os
 import logging
 import secrets
@@ -11,6 +11,7 @@ from kafka import KafkaProducer
 import json
 import psycopg2
 from psycopg2.extras import RealDictCursor
+import time
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -28,27 +29,70 @@ GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
 if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
     raise ValueError("GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET must be set in environment variables")
 
-# JWT Secret (read from environment variables)
+# JWT Secret
 JWT_SECRET = os.getenv("JWT_SECRET")
 if not JWT_SECRET:
     raise ValueError("JWT_SECRET must be set in environment variables")
 logger.info(f"Using JWT_SECRET: {JWT_SECRET}")
 JWT_ALGORITHM = "HS256"
 
-# Kafka Producer
+# Kafka Producer with retry logic
 KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
-producer = KafkaProducer(
-    bootstrap_servers=[KAFKA_BOOTSTRAP_SERVERS],
-    value_serializer=lambda v: json.dumps(v).encode('utf-8')
-)
+def init_kafka_producer(bootstrap_servers, retries=20, delay=5):
+    for attempt in range(retries):
+        try:
+            producer = KafkaProducer(
+                bootstrap_servers=[bootstrap_servers],
+                value_serializer=lambda v: json.dumps(v).encode('utf-8'),
+                retries=5,
+                request_timeout_ms=10000,
+                max_block_ms=10000,
+                connections_max_idle_ms=300000
+            )
+            producer.send('test-topic', {'test': 'connection'}).get(timeout=5)
+            logger.info("Successfully connected to Kafka")
+            return producer
+        except Exception as e:
+            logger.warning(f"Failed to connect to Kafka (attempt {attempt + 1}/{retries}): {str(e)}")
+            if attempt < retries - 1:
+                time.sleep(delay)
+            else:
+                raise Exception(f"Failed to connect to Kafka after {retries} attempts: {str(e)}")
 
-# PostgreSQL connection
-def get_db_connection():
-    conn = psycopg2.connect(
-        os.getenv("DATABASE_URL"),
-        cursor_factory=RealDictCursor
-    )
-    return conn
+try:
+    producer = init_kafka_producer(KAFKA_BOOTSTRAP_SERVERS)
+except Exception as e:
+    logger.error(f"Failed to initialize Kafka producer: {str(e)}")
+    raise e
+
+# PostgreSQL connection with retry logic
+def get_db_connection(retries=20, delay=5):
+    database_url = os.getenv("DATABASE_URL")
+    if not database_url:
+        raise ValueError("DATABASE_URL must be set in environment variables")
+    
+    for attempt in range(retries):
+        try:
+            conn = psycopg2.connect(
+                database_url,
+                cursor_factory=RealDictCursor
+            )
+            cursor = conn.cursor()
+            cursor.execute("SELECT 1")
+            cursor.close()
+            logger.info("Successfully connected to PostgreSQL")
+            return conn
+        except psycopg2.OperationalError as e:
+            logger.warning(f"Failed to connect to PostgreSQL (attempt {attempt + 1}/{retries}): {str(e)}")
+            if attempt < retries - 1:
+                time.sleep(delay)
+            else:
+                raise Exception(f"Failed to connect to PostgreSQL after {retries} attempts: {str(e)}")
+
+# Helper to check if user is admin
+def check_admin(user):
+    if user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
 
 # Register Google OAuth
 oauth = OAuth()
@@ -77,7 +121,6 @@ async def login(request: Request):
 @app.get("/auth")
 async def auth(request: Request):
     try:
-        # Get state from cookie
         state_from_request = request.query_params.get('state')
         state_from_cookie = request.cookies.get('oauth_state')
         logger.info(f"State from request: {state_from_request}")
@@ -90,7 +133,6 @@ async def auth(request: Request):
         if state_from_request != state_from_cookie:
             raise HTTPException(status_code=400, detail="State mismatch: CSRF warning")
 
-        # Fetch the token
         code = request.query_params.get('code')
         if not code:
             raise HTTPException(status_code=400, detail="No code provided in callback")
@@ -116,7 +158,6 @@ async def auth(request: Request):
             token = response.json()
         logger.info(f"Received token: {token}")
 
-        # Fetch user info
         userinfo_endpoint = "https://www.googleapis.com/oauth2/v3/userinfo"
         logger.info("Manually fetching user info...")
         async with httpx.AsyncClient() as client:
@@ -128,24 +169,31 @@ async def auth(request: Request):
             user = response.json()
         logger.info(f"Received user info: {user}")
 
-        # Store user in PostgreSQL
         conn = get_db_connection()
         cursor = conn.cursor()
         try:
+            # Insert or update user, but preserve the existing role
             cursor.execute(
                 """
-                INSERT INTO users (sub, email, name, picture)
-                VALUES (%s, %s, %s, %s)
+                INSERT INTO users (sub, email, name, picture, role)
+                VALUES (%s, %s, %s, %s, %s)
                 ON CONFLICT (sub) DO UPDATE
                 SET email = EXCLUDED.email,
                     name = EXCLUDED.name,
                     picture = EXCLUDED.picture
-                RETURNING id
+                RETURNING id, sub, email, name, picture, role
                 """,
-                (user["sub"], user["email"], user["name"], user.get("picture"))
+                (user["sub"], user["email"], user["name"], user.get("picture"), "employee")
             )
-            user_id = cursor.fetchone()['id']
+            db_user = cursor.fetchone()
             conn.commit()
+
+            # Fetch the user again to ensure we have the latest role
+            cursor.execute(
+                "SELECT id, sub, email, name, picture, role FROM users WHERE sub = %s",
+                (user["sub"],)
+            )
+            db_user = cursor.fetchone()
         except Exception as e:
             logger.error(f"Error storing user in database: {str(e)}")
             raise HTTPException(status_code=500, detail="Failed to store user")
@@ -153,28 +201,25 @@ async def auth(request: Request):
             cursor.close()
             conn.close()
 
-        # Generate JWT
         payload = {
-            "sub": user["sub"],
-            "email": user["email"],
-            "name": user["name"],
+            "sub": db_user["sub"],
+            "email": db_user["email"],
+            "name": db_user["name"],
+            "role": db_user["role"],  # Use the role from the database
             "exp": datetime.utcnow() + timedelta(hours=24)
         }
         jwt_token = jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
-        user["token"] = jwt_token
 
-        # Publish user_authenticated event to Kafka
         user_event = {
             "event_type": "user_authenticated",
-            "user_id": user["sub"],
-            "email": user["email"],
+            "user_id": db_user["sub"],
+            "email": db_user["email"],
             "timestamp": datetime.utcnow().isoformat()
         }
         producer.send('user-events', user_event)
         producer.flush()
         logger.info(f"Published user_authenticated event: {user_event}")
 
-        # Set JWT in a cookie
         response = responses.RedirectResponse(url='/users/me')
         response.set_cookie(key="jwt_token", value=jwt_token, httponly=True, samesite="lax", max_age=86400)
         response.delete_cookie("oauth_state")
@@ -192,22 +237,138 @@ async def get_current_user(request: Request):
         payload = jwt.decode(jwt_token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute("SELECT sub, email, name, picture FROM users WHERE sub = %s", (payload["sub"],))
-        user = cursor.fetchone()
-        if not user:
-            return {"message": "User not found"}
-        # Convert RealDictRow to a regular dict and add the token
-        user_dict = dict(user)
-        user_dict["token"] = jwt_token
-        return {"user": user_dict}
+        try:
+            cursor.execute("SELECT sub, email, name, picture, role FROM users WHERE sub = %s", (payload["sub"],))
+            user = cursor.fetchone()
+            if not user:
+                return {"message": "User not found"}
+            user_dict = dict(user)
+            user_dict["token"] = jwt_token
+            return {"user": user_dict}
+        finally:
+            cursor.close()
+            conn.close()
     except Exception as e:
         logger.error(f"Error fetching user: {str(e)}")
         return {"message": "Invalid token"}
-    finally:
-        cursor.close()
-        conn.close()
-        
 
+# Admin endpoints to manage users
+@app.get("/users/", response_model=list)
+async def get_all_users(request: Request):
+    jwt_token = request.cookies.get("jwt_token")
+    if not jwt_token:
+        raise HTTPException(status_code=401, detail="Not logged in")
+    try:
+        payload = jwt.decode(jwt_token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        check_admin(payload)
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("SELECT id, sub, email, name, picture, role FROM users")
+            users = cursor.fetchall()
+            return [dict(user) for user in users]
+        finally:
+            cursor.close()
+            conn.close()
+    except Exception as e:
+        logger.error(f"Error fetching users: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to fetch users")
+
+@app.put("/users/{user_id}/role")
+async def update_user_role(user_id: int, role: str, request: Request):
+    if role not in ["employee", "admin"]:
+        raise HTTPException(status_code=400, detail="Invalid role")
+    jwt_token = request.cookies.get("jwt_token")
+    if not jwt_token:
+        raise HTTPException(status_code=401, detail="Not logged in")
+    try:
+        payload = jwt.decode(jwt_token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        check_admin(payload)
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                "UPDATE users SET role = %s WHERE id = %s RETURNING id, sub, email, name, picture, role",
+                (role, user_id)
+            )
+            updated_user = cursor.fetchone()
+            if not updated_user:
+                raise HTTPException(status_code=404, detail="User not found")
+            conn.commit()
+            return dict(updated_user)
+        finally:
+            cursor.close()
+            conn.close()
+    except Exception as e:
+        logger.error(f"Error updating user role: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to update user role")
+
+@app.delete("/users/{user_id}")
+async def delete_user(user_id: int, request: Request):
+    jwt_token = request.cookies.get("jwt_token")
+    if not jwt_token:
+        raise HTTPException(status_code=401, detail="Not logged in")
+    try:
+        payload = jwt.decode(jwt_token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        check_admin(payload)
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("DELETE FROM users WHERE id = %s RETURNING id", (user_id,))
+            deleted_user = cursor.fetchone()
+            if not deleted_user:
+                raise HTTPException(status_code=404, detail="User not found")
+            conn.commit()
+            return {"message": f"User {user_id} deleted"}
+        finally:
+            cursor.close()
+            conn.close()
+    except Exception as e:
+        logger.error(f"Error deleting user: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to delete user")
+
+@app.get("/health")
+async def health_check():
+    health_status = {"status": "healthy", "details": {}}
+
+    # Check database connectivity
+    retries, delay = 5, 5
+    for attempt in range(retries):
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute("SELECT 1")  # Simple connectivity check
+            health_status["details"]["database"] = "healthy"
+            cursor.close()
+            conn.close()
+            break
+        except Exception as e:
+            logger.warning(f"Database health check retry {attempt + 1}/{retries}: {str(e)}")
+            if attempt == retries - 1:
+                logger.error(f"Database health check failed: {str(e)}")
+                health_status["details"]["database"] = f"unhealthy: {str(e)}"
+                health_status["status"] = "unhealthy"
+            time.sleep(delay)
+
+    # Check Kafka connectivity
+    for attempt in range(retries):
+        try:
+            # Check if Kafka broker is reachable without sending a message
+            producer.bootstrap_connected()
+            health_status["details"]["kafka"] = "healthy"
+            break
+        except Exception as e:
+            logger.warning(f"Kafka health check retry {attempt + 1}/{retries}: {str(e)}")
+            if attempt == retries - 1:
+                logger.error(f"Kafka health check failed: {str(e)}")
+                health_status["details"]["kafka"] = f"unhealthy: {str(e)}"
+                health_status["status"] = "unhealthy"
+            time.sleep(delay)
+
+    logger.info(f"Health check result: {health_status}")
+    if health_status["status"] == "unhealthy":
+        raise HTTPException(status_code=503, detail=health_status)
+    return health_status
 
 @app.get("/favicon.ico")
 async def favicon():
