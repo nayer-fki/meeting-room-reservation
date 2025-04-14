@@ -1,6 +1,8 @@
-from fastapi import FastAPI, HTTPException, Depends, Request
+from fastapi import FastAPI, HTTPException, Depends
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from datetime import datetime
+from datetime import datetime, timedelta
 import os
 import logging
 import jwt
@@ -9,7 +11,7 @@ from kafka import KafkaProducer
 import json
 import psycopg2
 from psycopg2.extras import RealDictCursor
-from typing import Optional  # Import Optional for Python 3.9 compatibility
+from typing import Optional
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -17,6 +19,15 @@ logger = logging.getLogger(__name__)
 
 # Initialize FastAPI app
 app = FastAPI()
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Load environment variables
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -80,6 +91,19 @@ def get_db_connection(retries=20, delay=5):
             else:
                 raise Exception(f"Failed to connect to PostgreSQL after {retries} attempts: {str(e)}")
 
+# JWT verification
+security = HTTPBearer()
+
+async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    try:
+        token = credentials.credentials
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        return payload
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token has expired")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
 # Pydantic models
 class RoomCreate(BaseModel):
     name: str
@@ -91,18 +115,6 @@ class RoomUpdate(BaseModel):
     capacity: Optional[int] = None
     location: Optional[str] = None
 
-# Helper to get current user from JWT
-async def get_current_user(request: Request):
-    jwt_token = request.cookies.get("jwt_token")
-    if not jwt_token:
-        raise HTTPException(status_code=401, detail="Not logged in")
-    try:
-        payload = jwt.decode(jwt_token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-        return payload
-    except Exception as e:
-        logger.error(f"Invalid token: {str(e)}")
-        raise HTTPException(status_code=401, detail="Invalid token")
-
 # Helper to check if user is admin
 def check_admin(user):
     if user.get("role") != "admin":
@@ -110,7 +122,7 @@ def check_admin(user):
 
 # Create a room (admin only)
 @app.post("/rooms/", response_model=dict)
-async def create_room(room: RoomCreate, user: dict = Depends(get_current_user)):
+async def create_room(room: RoomCreate, user: dict = Depends(verify_token)):
     check_admin(user)
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -152,7 +164,7 @@ async def create_room(room: RoomCreate, user: dict = Depends(get_current_user)):
 
 # Get all rooms (available to all authenticated users)
 @app.get("/rooms/", response_model=list)
-async def get_rooms(user: dict = Depends(get_current_user)):
+async def get_rooms(user: dict = Depends(verify_token)):
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
@@ -181,7 +193,7 @@ async def get_rooms(user: dict = Depends(get_current_user)):
 
 # Get a specific room (available to all authenticated users)
 @app.get("/rooms/{room_id}", response_model=dict)
-async def get_room(room_id: int, user: dict = Depends(get_current_user)):
+async def get_room(room_id: int, user: dict = Depends(verify_token)):
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
@@ -209,7 +221,7 @@ async def get_room(room_id: int, user: dict = Depends(get_current_user)):
 
 # Update a room (admin only)
 @app.put("/rooms/{room_id}", response_model=dict)
-async def update_room(room_id: int, room_update: RoomUpdate, user: dict = Depends(get_current_user)):
+async def update_room(room_id: int, room_update: RoomUpdate, user: dict = Depends(verify_token)):
     check_admin(user)
     update_data = room_update.dict(exclude_unset=True)
     if not update_data:
@@ -260,7 +272,7 @@ async def update_room(room_id: int, room_update: RoomUpdate, user: dict = Depend
 
 # Delete a room (admin only)
 @app.delete("/rooms/{room_id}", response_model=dict)
-async def delete_room(room_id: int, user: dict = Depends(get_current_user)):
+async def delete_room(room_id: int, user: dict = Depends(verify_token)):
     check_admin(user)
     conn = get_db_connection()
     cursor = conn.cursor()

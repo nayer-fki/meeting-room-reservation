@@ -1,4 +1,5 @@
 from fastapi import FastAPI, Request, HTTPException, responses
+from fastapi.middleware.cors import CORSMiddleware  # Add CORS middleware import
 from authlib.integrations.starlette_client import OAuth
 from starlette.middleware.sessions import SessionMiddleware
 import os
@@ -22,6 +23,15 @@ app = FastAPI()
 
 # Add SessionMiddleware with a secret key
 app.add_middleware(SessionMiddleware, secret_key=secrets.token_hex(32))
+
+# Add CORS middleware to allow requests from the frontend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Load environment variables
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
@@ -205,7 +215,7 @@ async def auth(request: Request):
             "sub": db_user["sub"],
             "email": db_user["email"],
             "name": db_user["name"],
-            "role": db_user["role"],  # Use the role from the database
+            "role": db_user["role"],
             "exp": datetime.utcnow() + timedelta(hours=24)
         }
         jwt_token = jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
@@ -220,13 +230,15 @@ async def auth(request: Request):
         producer.flush()
         logger.info(f"Published user_authenticated event: {user_event}")
 
-        response = responses.RedirectResponse(url='/users/me')
-        response.set_cookie(key="jwt_token", value=jwt_token, httponly=True, samesite="lax", max_age=86400)
+        # Redirect to the frontend with the token as a query parameter
+        redirect_url = f'http://localhost:3000/auth-callback?token={jwt_token}'
+        response = responses.RedirectResponse(url=redirect_url)
         response.delete_cookie("oauth_state")
         return response
     except Exception as e:
         logger.error(f"Authentication error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Authentication error: {str(e)}")
+    
 
 @app.get("/users/me")
 async def get_current_user(request: Request):
