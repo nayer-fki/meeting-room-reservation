@@ -19,3 +19,4 @@ A DevOps project to manage meeting room reservations using microservices, built 
 - Author: Mohamed Najeh ISSAOUI
 - Email: issaoui.mn@itbs.tn
 # Re-run CI/CD workflow with updated Docker Hub token permissions
+# Re-run CI/CD workflow with updated Docker Hub token scopes
