@@ -25,3 +25,7 @@ build/
 
 # Misc
 *.DS_Store
+
+debug_output.yaml
+rendered.yaml
+meeting-room-reservation/rendered.yaml
