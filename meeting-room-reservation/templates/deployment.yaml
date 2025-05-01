@@ -1,78 +1,178 @@
+# Deployment for user-service
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "meeting-room-reservation.fullname" . }}
-  labels:
-    {{- include "meeting-room-reservation.labels" . | nindent 4 }}
+  name: {{ .Values.userService.name }}
 spec:
-  {{- if not .Values.autoscaling.enabled }}
-  replicas: {{ .Values.replicaCount }}
-  {{- end }}
+  replicas: {{ .Values.userService.replicas }}
   selector:
     matchLabels:
-      {{- include "meeting-room-reservation.selectorLabels" . | nindent 6 }}
+      app: {{ .Values.userService.name }}
   template:
     metadata:
-      {{- with .Values.podAnnotations }}
-      annotations:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
       labels:
-        {{- include "meeting-room-reservation.labels" . | nindent 8 }}
-        {{- with .Values.podLabels }}
-        {{- toYaml . | nindent 8 }}
-        {{- end }}
+        app: {{ .Values.userService.name }}
     spec:
-      {{- with .Values.imagePullSecrets }}
-      imagePullSecrets:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
-      serviceAccountName: {{ include "meeting-room-reservation.serviceAccountName" . }}
-      {{- with .Values.podSecurityContext }}
-      securityContext:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
       containers:
-        - name: {{ .Chart.Name }}
-          {{- with .Values.securityContext }}
-          securityContext:
-            {{- toYaml . | nindent 12 }}
-          {{- end }}
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
-          imagePullPolicy: {{ .Values.image.pullPolicy }}
-          ports:
-            - name: http
-              containerPort: {{ .Values.service.port }}
-              protocol: TCP
-          {{- with .Values.livenessProbe }}
-          livenessProbe:
-            {{- toYaml . | nindent 12 }}
-          {{- end }}
-          {{- with .Values.readinessProbe }}
-          readinessProbe:
-            {{- toYaml . | nindent 12 }}
-          {{- end }}
-          {{- with .Values.resources }}
-          resources:
-            {{- toYaml . | nindent 12 }}
-          {{- end }}
-          {{- with .Values.volumeMounts }}
-          volumeMounts:
-            {{- toYaml . | nindent 12 }}
-          {{- end }}
-      {{- with .Values.volumes }}
-      volumes:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
-      {{- with .Values.nodeSelector }}
-      nodeSelector:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
-      {{- with .Values.affinity }}
-      affinity:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
-      {{- with .Values.tolerations }}
-      tolerations:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
+      - name: {{ .Values.userService.name }}
+        image: {{ .Values.userService.image }}:{{ .Values.userService.tag }}
+        ports:
+        - containerPort: {{ .Values.userService.port }}
+        env:
+        - name: GOOGLE_CLIENT_ID
+          valueFrom:
+            secretKeyRef:
+              name: {{ .Values.secrets.name }}
+              key: GOOGLE_CLIENT_ID
+        - name: GOOGLE_CLIENT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: {{ .Values.secrets.name }}
+              key: GOOGLE_CLIENT_SECRET
+---
+# Deployment for salle-service
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Values.salleService.name }}
+spec:
+  replicas: {{ .Values.salleService.replicas }}
+  selector:
+    matchLabels:
+      app: {{ .Values.salleService.name }}
+  template:
+    metadata:
+      labels:
+        app: {{ .Values.salleService.name }}
+    spec:
+      containers:
+      - name: {{ .Values.salleService.name }}
+        image: {{ .Values.salleService.image }}:{{ .Values.salleService.tag }}
+        ports:
+        - containerPort: {{ .Values.salleService.port }}
+---
+# Deployment for reservation-service
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Values.reservationService.name }}
+spec:
+  replicas: {{ .Values.reservationService.replicas }}
+  selector:
+    matchLabels:
+      app: {{ .Values.reservationService.name }}
+  template:
+    metadata:
+      labels:
+        app: {{ .Values.reservationService.name }}
+    spec:
+      containers:
+      - name: {{ .Values.reservationService.name }}
+        image: {{ .Values.reservationService.image }}:{{ .Values.reservationService.tag }}
+        ports:
+        - containerPort: {{ .Values.reservationService.port }}
+---
+# Deployment for api-gateway
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Values.apiGateway.name }}
+spec:
+  replicas: {{ .Values.apiGateway.replicas }}
+  selector:
+    matchLabels:
+      app: {{ .Values.apiGateway.name }}
+  template:
+    metadata:
+      labels:
+        app: {{ .Values.apiGateway.name }}
+    spec:
+      containers:
+      - name: {{ .Values.apiGateway.name }}
+        image: {{ .Values.apiGateway.image }}:{{ .Values.apiGateway.tag }}
+        ports:
+        - containerPort: {{ .Values.apiGateway.port }}
+---
+# Deployment for frontend
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Values.frontend.name }}
+spec:
+  replicas: {{ .Values.frontend.replicas }}
+  selector:
+    matchLabels:
+      app: {{ .Values.frontend.name }}
+  template:
+    metadata:
+      labels:
+        app: {{ .Values.frontend.name }}
+    spec:
+      containers:
+      - name: {{ .Values.frontend.name }}
+        image: {{ .Values.frontend.image }}:{{ .Values.frontend.tag }}
+        ports:
+        - containerPort: {{ .Values.frontend.port }}
+---
+# Deployment for postgres
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Values.postgres.name }}
+spec:
+  replicas: {{ .Values.postgres.replicas }}
+  selector:
+    matchLabels:
+      app: {{ .Values.postgres.name }}
+  template:
+    metadata:
+      labels:
+        app: {{ .Values.postgres.name }}
+    spec:
+      containers:
+      - name: {{ .Values.postgres.name }}
+        image: {{ .Values.postgres.image }}:{{ .Values.postgres.tag }}
+        ports:
+        - containerPort: {{ .Values.postgres.port }}
+---
+# Deployment for zookeeper
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Values.zookeeper.name }}
+spec:
+  replicas: {{ .Values.zookeeper.replicas }}
+  selector:
+    matchLabels:
+      app: {{ .Values.zookeeper.name }}
+  template:
+    metadata:
+      labels:
+        app: {{ .Values.zookeeper.name }}
+    spec:
+      containers:
+      - name: {{ .Values.zookeeper.name }}
+        image: {{ .Values.zookeeper.image }}:{{ .Values.zookeeper.tag }}
+        ports:
+        - containerPort: {{ .Values.zookeeper.port }}
+---
+# Deployment for kafka
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Values.kafka.name }}
+spec:
+  replicas: {{ .Values.kafka.replicas }}
+  selector:
+    matchLabels:
+      app: {{ .Values.kafka.name }}
+  template:
+    metadata:
+      labels:
+        app: {{ .Values.kafka.name }}
+    spec:
+      containers:
+      - name: {{ .Values.kafka.name }}
+        image: {{ .Values.kafka.image }}:{{ .Values.kafka.tag }}
+        ports:
+        - containerPort: {{ .Values.kafka.port }}
