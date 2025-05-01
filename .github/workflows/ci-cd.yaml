@@ -1,0 +1,108 @@
+name: CI/CD Pipeline for Meeting Room Reservation
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-and-test-backend:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: [user-service, salle-service, reservation-service, api-gateway]
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4  # Update to v4 for the latest version
+
+    - name: Set up Python
+      uses: actions/setup-python@v5  # Update to v5 for the latest version
+      with:
+        python-version: '3.9'
+
+    - name: Install dependencies
+      run: |
+        cd ${{ matrix.service }}
+        if [ -f requirements.txt ]; then
+          pip install -r requirements.txt
+        else
+          echo "requirements.txt not found in ${{ matrix.service }}"
+          exit 1
+        fi
+
+    - name: Run tests
+      run: |
+        cd ${{ matrix.service }}
+        if [ -d tests ]; then
+          pytest --cov=./ --cov-report=xml
+        else
+          echo "No tests directory found in ${{ matrix.service }}, skipping tests"
+        fi
+
+    - name: Build Docker image
+      run: |
+        cd ${{ matrix.service }}
+        docker build -t nayer564/meeting-room-reservation-${{ matrix.service }}:latest .
+
+    - name: Log in to Docker Hub
+      uses: docker/login-action@v3  # Update to v3 for the latest version
+      with:
+        username: ${{ secrets.DOCKERHUB_USERNAME }}
+        password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+    - name: Push Docker image
+      run: |
+        docker push nayer564/meeting-room-reservation-${{ matrix.service }}:latest
+
+  build-and-test-frontend:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4  # Update to v4 for the latest version
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v4  # Update to v4 for the latest version
+      with:
+        node-version: '18'
+
+    - name: Install dependencies
+      run: |
+        cd frontend
+        npm install
+
+    - name: Run tests
+      run: |
+        cd frontend
+        npm test -- --passWithNoTests  # Allow tests to pass if no tests are defined
+
+    - name: Build Docker image
+      run: |
+        cd frontend
+        docker build -t nayer564/meeting-room-reservation-frontend:latest .
+
+    - name: Log in to Docker Hub
+      uses: docker/login-action@v3  # Update to v3 for the latest version
+      with:
+        username: ${{ secrets.DOCKERHUB_USERNAME }}
+        password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+    - name: Push Docker image
+      run: |
+        docker push nayer564/meeting-room-reservation-frontend:latest
+
+  # deploy:
+  #   needs: [build-and-test-backend, build-and-test-frontend]
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #   - name: Checkout code
+  #     uses: actions/checkout@v4
+  #
+  #   - name: Set up Helm
+  #     uses: azure/setup-helm@v4
+  #     with:
+  #       version: v3.9.0
+  #
+  #   - name: Deploy to Kubernetes
+  #     run: |
+  #       helm upgrade --install meeting-room-reservation ./meeting-room-reservation --values meeting-room-reservation/values.yaml --namespace default
