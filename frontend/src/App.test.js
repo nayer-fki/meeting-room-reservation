@@ -9,9 +9,9 @@ test('renders login page after loading', async () => {
     expect(screen.queryByText(/Chargement/i)).not.toBeInTheDocument();
   }, { timeout: 3000 });
 
-  // Wait for the login page element to appear
-  const loginPage = await screen.findByRole('button', { name: /login/i }, { timeout: 3000 });
+  // Wait for the login button to appear
+  const loginButton = await screen.findByRole('button', { name: /se connecter avec google/i }, { timeout: 3000 });
 
-  // Assert that the login page is in the document
-  expect(loginPage).toBeInTheDocument();
+  // Assert that the login button is in the document
+  expect(loginButton).toBeInTheDocument();
 });
