@@ -1,0 +1,7 @@
+FROM fluent/fluentd:v1.14-1
+
+RUN gem install --user fluent-plugin-cloudwatch-logs
+
+COPY fluentd.conf /fluentd/etc/fluentd.conf
+
+CMD ["fluentd", "-c", "/fluentd/etc/fluentd.conf"]

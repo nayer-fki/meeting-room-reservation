@@ -106,6 +106,7 @@ services:
       - api-gateway
     networks:
       - app-network
+
   postgres:
     image: postgres:13
     environment:
@@ -177,6 +178,55 @@ services:
     networks:
       - app-network
 
+  # Added monitoring services for Loki, Promtail, Prometheus, Grafana, and Fluentd
+  loki:
+    image: nayer564/meeting-room-reservation-loki:latest
+    ports:
+      - "3100:3100"
+    volumes:
+      - loki-data:/loki
+    networks:
+      - app-network
+
+  promtail:
+    image: nayer564/meeting-room-reservation-promtail:latest
+    volumes:
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      - loki
+    networks:
+      - app-network
+
+  prometheus:
+    image: nayer564/meeting-room-reservation-prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - prometheus-data:/prometheus
+    networks:
+      - app-network
+
+  grafana:
+    image: nayer564/meeting-room-reservation-grafana:latest
+    ports:
+      - "3001:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin123
+    depends_on:
+      - loki
+      - prometheus
+    networks:
+      - app-network
+
+  fluentd:
+    image: nayer564/meeting-room-reservation-fluentd:latest
+    volumes:
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+    networks:
+      - app-network
+
 networks:
   app-network:
     driver: bridge
@@ -185,3 +235,6 @@ volumes:
   postgres_data:
   zookeeper_data:
   kafka_data:
+  # Added volumes for monitoring services
+  loki-data:
+  prometheus-data:
