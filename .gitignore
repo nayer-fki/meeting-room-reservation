@@ -1,3 +1,8 @@
+# Existing patterns (if any)
+.env
+*.env
+*secret*.yaml
+
 # Python
 __pycache__/
 *.pyc
@@ -5,7 +10,6 @@ __pycache__/
 *.pyd
 .Python
 venv/
-*.env
 
 # Node.js (React)
 node_modules/
