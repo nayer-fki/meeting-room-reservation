@@ -1,15 +1,104 @@
+# service.yaml
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ include "meeting-room-reservation.fullname" . }}
-  labels:
-    {{- include "meeting-room-reservation.labels" . | nindent 4 }}
+  name: {{ .Values.userService.name }}
 spec:
-  type: {{ .Values.service.type }}
-  ports:
-    - port: {{ .Values.service.port }}
-      targetPort: http
-      protocol: TCP
-      name: http
   selector:
-    {{- include "meeting-room-reservation.selectorLabels" . | nindent 4 }}
+    app: {{ .Values.userService.name }}
+  ports:
+  - protocol: TCP
+    port: {{ .Values.userService.port }}
+    targetPort: {{ .Values.userService.port }}
+  type: ClusterIP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.salleService.name }}
+spec:
+  selector:
+    app: {{ .Values.salleService.name }}
+  ports:
+  - protocol: TCP
+    port: {{ .Values.salleService.port }}
+    targetPort: {{ .Values.salleService.port }}
+  type: ClusterIP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.reservationService.name }}
+spec:
+  selector:
+    app: {{ .Values.reservationService.name }}
+  ports:
+  - protocol: TCP
+    port: {{ .Values.reservationService.port }}
+    targetPort: {{ .Values.reservationService.port }}
+  type: ClusterIP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.apiGateway.name }}
+spec:
+  selector:
+    app: {{ .Values.apiGateway.name }}
+  ports:
+  - protocol: TCP
+    port: {{ .Values.apiGateway.port }}
+    targetPort: {{ .Values.apiGateway.port }}
+  type: ClusterIP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.frontend.name }}
+spec:
+  selector:
+    app: {{ .Values.frontend.name }}
+  ports:
+  - protocol: TCP
+    port: {{ .Values.frontend.port }}
+    targetPort: {{ .Values.frontend.port }}
+  type: ClusterIP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.postgres.name }}
+spec:
+  selector:
+    app: {{ .Values.postgres.name }}
+  ports:
+  - protocol: TCP
+    port: {{ .Values.postgres.port }}
+    targetPort: {{ .Values.postgres.port }}
+  type: ClusterIP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.zookeeper.name }}
+spec:
+  selector:
+    app: {{ .Values.zookeeper.name }}
+  ports:
+  - protocol: TCP
+    port: {{ .Values.zookeeper.port }}
+    targetPort: {{ .Values.zookeeper.port }}
+  type: ClusterIP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.kafka.name }}
+spec:
+  selector:
+    app: {{ .Values.kafka.name }}
+  ports:
+  - protocol: TCP
+    port: {{ .Values.kafka.port }}
+    targetPort: {{ .Values.kafka.port }}
+  type: ClusterIP

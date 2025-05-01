@@ -1,43 +1,36 @@
-{{- if .Values.ingress.enabled -}}
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
-  name: {{ include "meeting-room-reservation.fullname" . }}
-  labels:
-    {{- include "meeting-room-reservation.labels" . | nindent 4 }}
-  {{- with .Values.ingress.annotations }}
-  annotations:
-    {{- toYaml . | nindent 4 }}
-  {{- end }}
+  name: {{ .Values.ingress.name }}
 spec:
-  {{- with .Values.ingress.className }}
-  ingressClassName: {{ . }}
-  {{- end }}
-  {{- if .Values.ingress.tls }}
-  tls:
-    {{- range .Values.ingress.tls }}
-    - hosts:
-        {{- range .hosts }}
-        - {{ . | quote }}
-        {{- end }}
-      secretName: {{ .secretName }}
-    {{- end }}
-  {{- end }}
   rules:
-    {{- range .Values.ingress.hosts }}
-    - host: {{ .host | quote }}
-      http:
-        paths:
-          {{- range .paths }}
-          - path: {{ .path }}
-            {{- with .pathType }}
-            pathType: {{ . }}
-            {{- end }}
-            backend:
-              service:
-                name: {{ include "meeting-room-reservation.fullname" $ }}
-                port:
-                  number: {{ $.Values.service.port }}
-          {{- end }}
-    {{- end }}
-{{- end }}
+  - http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: {{ .Values.frontend.name }}
+            port:
+              number: {{ .Values.frontend.port }}
+      - path: /api/user
+        pathType: Prefix
+        backend:
+          service:
+            name: {{ .Values.userService.name }}
+            port:
+              number: {{ .Values.userService.port }}
+      - path: /api/salle
+        pathType: Prefix
+        backend:
+          service:
+            name: {{ .Values.salleService.name }}
+            port:
+              number: {{ .Values.salleService.port }}
+      - path: /api/reservation
+        pathType: Prefix
+        backend:
+          service:
+            name: {{ .Values.reservationService.name }}
+            port:
+              number: {{ .Values.reservationService.port }}
