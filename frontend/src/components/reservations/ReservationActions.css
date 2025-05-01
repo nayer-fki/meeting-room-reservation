@@ -1,0 +1,86 @@
+/* frontend/src/components/reservations/ReservationActions.css */
+.reservation-actions {
+  margin-top: 2rem;
+}
+
+.reservation-actions h3 {
+  font-size: 1.25rem;
+  color: #4a5568;
+  margin-bottom: 1rem;
+}
+
+.action-table {
+  width: 100%;
+  border-collapse: collapse;
+  background-color: #fff;
+  border: 1px solid #e2e8f0;
+  border-radius: 0.5rem;
+}
+
+.action-table th,
+.action-table td {
+  padding: 0.75rem;
+  border-bottom: 1px solid #e2e8f0;
+  text-align: left;
+}
+
+.action-table th {
+  background-color: #f7fafc;
+  color: #4a5568;
+}
+
+.action-table td {
+  vertical-align: middle;
+}
+
+.approve-button,
+.deny-button {
+  padding: 0.5rem 1rem;
+  border: none;
+  border-radius: 0.375rem;
+  cursor: pointer;
+  margin-right: 0.5rem;
+  transition: background-color 0.3s ease;
+}
+
+.approve-button {
+  background-color: #48bb78;
+  color: #fff;
+}
+
+.approve-button:hover:not(:disabled) {
+  background-color: #38a169;
+}
+
+.deny-button {
+  background-color: #e53e3e;
+  color: #fff;
+}
+
+.deny-button:hover:not(:disabled) {
+  background-color: #c53030;
+}
+
+.approve-button:disabled,
+.deny-button:disabled {
+  background-color: #e2e8f0;
+  cursor: not-allowed;
+}
+
+.priority-select {
+  padding: 0.5rem;
+  border: 1px solid #d1d5db;
+  border-radius: 0.375rem;
+  font-size: 0.9rem;
+}
+
+.no-data {
+  color: #718096;
+  font-style: italic;
+  padding: 1rem;
+}
+
+.form-error {
+  color: #e53e3e;
+  margin-bottom: 1rem;
+}

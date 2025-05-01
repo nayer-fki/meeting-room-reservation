@@ -1,43 +1,38 @@
 version: '3.8'
-
 services:
   user-service:
     image: meeting-room-reservation-user-service
-    build:
-      context: ./user-service
-      dockerfile: Dockerfile
+    build: ./user-service
     ports:
       - "8001:8001"
-    environment:
-      - DATABASE_URL=postgresql://meeting_user:12345@postgres:5432/meeting_room_db
-      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
-      - JWT_SECRET=a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0
     env_file:
       - ./user-service/.env
+    environment:
+      - DATABASE_URL=postgresql://meeting_user:12345@postgres:5432/meeting_room_db
+      - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID}
+      - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET}
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - JWT_SECRET=a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0
+      - SESSION_SECRET_KEY=a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6
+      - OAUTH_REDIRECT_URI=http://localhost:8080/api/auth
+      - FRONTEND_REDIRECT_URL=http://localhost:3000/
     depends_on:
       postgres:
         condition: service_healthy
       kafka:
         condition: service_healthy
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 120s
     restart: unless-stopped
+    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8001"]
     networks:
-      app-network:
-        aliases:
-          - user-service
+      - app-network
 
   salle-service:
     image: meeting-room-reservation-salle-service
-    build:
-      context: ./salle-service
-      dockerfile: Dockerfile
+    build: ./salle-service
     ports:
       - "8002:8002"
+    env_file:
+      - ./salle-service/.env
     environment:
       - DATABASE_URL=postgresql://meeting_user:12345@postgres:5432/meeting_room_db
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
@@ -47,30 +42,22 @@ services:
         condition: service_healthy
       kafka:
         condition: service_healthy
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 120s
     restart: unless-stopped
+    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8002"]
     networks:
-      app-network:
-        aliases:
-          - salle-service
+      - app-network
 
   reservation-service:
     image: meeting-room-reservation-reservation-service
-    build:
-      context: ./reservation-service
-      dockerfile: Dockerfile
+    build: ./reservation-service
     ports:
       - "8003:8003"
+    env_file:
+      - ./reservation-service/.env
     environment:
       - DATABASE_URL=postgresql://meeting_user:12345@postgres:5432/meeting_room_db
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
       - JWT_SECRET=a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0
-      - SALLE_SERVICE_URL=http://api-gateway:80/api/rooms
     depends_on:
       postgres:
         condition: service_healthy
@@ -78,42 +65,49 @@ services:
         condition: service_healthy
       salle-service:
         condition: service_started
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8003/health"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 120s
     restart: unless-stopped
+    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8003"]
     networks:
-      app-network:
-        aliases:
-          - reservation-service
+      - app-network
 
-  notification-service:
-    image: meeting-room-reservation-notification-service
+  api-gateway:
+    image: meeting-room-reservation-api-gateway
     build:
-      context: ./notification-service
+      context: ./api-gateway
       dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
     environment:
-      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
-      - SMTP_SERVER=smtp.gmail.com
-      - SMTP_PORT=587
-      - SMTP_USERNAME=your-real-email@gmail.com
-      - SMTP_PASSWORD=your-real-app-password
-      - NOTIFICATION_EMAIL=your-recipient-email@example.com
+      - USER_SERVICE_URL=http://user-service:8001
+      - SALLE_SERVICE_URL=http://salle-service:8002
+      - RESERVATION_SERVICE_URL=http://reservation-service:8003
+      - JWT_SECRET=a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0
+      - HEALTH_CHECK_TIMEOUT=5
+      - CORS_ALLOWED_ORIGINS=http://localhost:3000
     depends_on:
-      kafka:
-        condition: service_healthy
+      user-service:
+        condition: service_started  # Reverted to service_started
+      salle-service:
+        condition: service_started  # Reverted to service_started
+      reservation-service:
+        condition: service_started  # Reverted to service_started
     restart: unless-stopped
     networks:
-      app-network:
-        aliases:
-          - notification-service
+      - app-network
 
+  frontend:
+    image: meeting-room-reservation-frontend
+    build: ./frontend
+    ports:
+      - "3000:80"
+    volumes:
+      - ./frontend/nginx.conf:/etc/nginx/conf.d/default.conf:ro # Mount the custom nginx.conf
+    depends_on:
+      - api-gateway
+    networks:
+      - app-network
   postgres:
     image: postgres:13
-    container_name: meeting-room-reservation-postgres
     environment:
       - POSTGRES_DB=meeting_room_db
       - POSTGRES_USER=meeting_user
@@ -126,43 +120,37 @@ services:
       test: ["CMD-SHELL", "pg_isready -U meeting_user -d meeting_room_db"]
       interval: 5s
       timeout: 5s
-      retries: 10
-      start_period: 20s
-    restart: unless-stopped
+      retries: 5
+      start_period: 10s
     networks:
       - app-network
 
   zookeeper:
     image: bitnami/zookeeper:3.9
-    container_name: meeting-room-reservation-zookeeper
+    user: "1001"  # Added to fix potential volume permission issues
     environment:
       - ALLOW_ANONYMOUS_LOGIN=yes
       - ZOOKEEPER_CLIENT_PORT=2181
       - ZOOKEEPER_TICK_TIME=2000
-      - ZOO_AUTOPURGE_SNAP_RETAIN_COUNT=3
-      - ZOO_AUTOPURGE_PURGE_INTERVAL=1
     ports:
       - "2181:2181"
     volumes:
       - zookeeper_data:/bitnami/zookeeper
     healthcheck:
       test: ["CMD", "/opt/bitnami/zookeeper/bin/zkServer.sh", "status"]
-      interval: 5s
+      interval: 10s
       timeout: 5s
-      retries: 10
-      start_period: 30s
+      retries: 5
+      start_period: 90s  # Increased to give Zookeeper more time to start
     restart: unless-stopped
     networks:
-      app-network:
-        aliases:
-          - zookeeper
+      - app-network
 
   kafka:
     image: bitnami/kafka:3.7
-    container_name: meeting-room-reservation-kafka
     depends_on:
       zookeeper:
-        condition: service_started
+        condition: service_healthy
     environment:
       - KAFKA_BROKER_ID=1
       - KAFKA_CFG_ZOOKEEPER_CONNECT=zookeeper:2181
@@ -173,76 +161,21 @@ services:
       - KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE=true
       - KAFKA_CFG_NUM_PARTITIONS=1
       - KAFKA_CFG_DEFAULT_REPLICATION_FACTOR=1
-      - KAFKA_OFFSETS_TOPIC_NUM_PARTITIONS=1
-      - KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1
-      - KAFKA_ZOOKEEPER_SESSION_TIMEOUT_MS=6000
+      - KAFKA_CFG_OFFSETS_TOPIC_REPLICATION_FACTOR=1  # Added to ensure offsets topic can be created with replication factor 1
     ports:
       - "9092:9092"
     volumes:
       - kafka_data:/bitnami/kafka
     healthcheck:
       test: ["CMD", "kafka-topics.sh", "--list", "--bootstrap-server", "localhost:9092"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
-      start_period: 30s
-    restart: unless-stopped
-    networks:
-      app-network:
-        aliases:
-          - kafka
-
-  frontend:
-    image: meeting-room-reservation-frontend
-    build:
-      context: ./frontend
-      dockerfile: Dockerfile
-    ports:
-      - "3000:3000"
-    environment:
-      - NODE_OPTIONS=--no-deprecation
-      - REACT_APP_API_URL=http://localhost:80/api
-    depends_on:
-      - user-service
-      - salle-service
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:3000"]
       interval: 10s
-      timeout: 5s
+      timeout: 10s
       retries: 5
-      start_period: 30s
+      start_period: 120s  # Increased to give Kafka more time to start
+    command: ["sh", "-c", "sleep 30 && /opt/bitnami/scripts/kafka/entrypoint.sh /opt/bitnami/scripts/kafka/run.sh"]  # Added delay for Kafka startup
     restart: unless-stopped
     networks:
-      app-network:
-        aliases:
-          - frontend
-
-  api-gateway:
-    image: meeting-room-reservation-api-gateway
-    build:
-      context: ./api-gateway
-      dockerfile: Dockerfile
-    volumes:
-      - ./api-gateway/nginx.conf:/etc/nginx/nginx.conf
-      - ./api-gateway/scripts/wait-for-frontend.sh:/wait-for-frontend.sh
-    entrypoint: ["/wait-for-frontend.sh"]
-    command: ["nginx", "-g", "daemon off;"]
-    ports:
-      - "80:80"
-    depends_on:
-      user-service:
-        condition: service_started
-      salle-service:
-        condition: service_started
-      reservation-service:
-        condition: service_started
-      frontend:
-        condition: service_started
-    restart: unless-stopped
-    networks:
-      app-network:
-        aliases:
-          - api-gateway
+      - app-network
 
 networks:
   app-network:

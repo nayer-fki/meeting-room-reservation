@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+httpx
+authlib
+python-dotenv
+psycopg2-binary
+kafka-python
+PyJWT>=2.8.0

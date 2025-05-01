@@ -1,0 +1,13 @@
+/* frontend/src/pages/AdminDashboardPage.css */
+.user-info {
+  margin-bottom: 1.5rem;
+}
+
+.user-info p {
+  color: #4a5568;
+  font-size: 1.1rem;
+}
+
+.section {
+  margin-bottom: 3rem;
+}

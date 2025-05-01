@@ -1,0 +1,37 @@
+/* frontend/src/styles/global.css */
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+  }
+  
+  body {
+    font-family: Arial, sans-serif;
+    background-color: #f9fafb;
+    color: #333;
+  }
+  
+  .container {
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 20px;
+  }
+  
+  h1 {
+    font-size: 2.5rem;
+    text-align: center;
+    color: #2d3748;
+    margin-bottom: 2rem;
+  }
+  
+  h2 {
+    font-size: 1.75rem;
+    color: #4a5568;
+    margin-bottom: 1rem;
+  }
+  
+  .error {
+    color: #e53e3e;
+    text-align: center;
+    margin-bottom: 1rem;
+  }

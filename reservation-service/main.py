@@ -1,18 +1,17 @@
 import os
 import logging
 from datetime import datetime
-from typing import List, Optional
-from fastapi import FastAPI, HTTPException, Depends, Header
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, ForeignKey
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, Session, relationship
+from fastapi import FastAPI, HTTPException, Depends, Request
+from pydantic import BaseModel
+import jwt
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from kafka import KafkaProducer
 import json
-import jwt
-import requests
+import httpx
 from dotenv import load_dotenv
 import time
-from pydantic import BaseModel
+from typing import Optional, Tuple
 
 # Load environment variables
 load_dotenv()
@@ -26,7 +25,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise ValueError("DATABASE_URL must be set in environment variables")
 
-KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS")
+KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
 if not KAFKA_BOOTSTRAP_SERVERS:
     raise ValueError("KAFKA_BOOTSTRAP_SERVERS must be set in environment variables")
 
@@ -36,334 +35,612 @@ if not JWT_SECRET:
 
 JWT_ALGORITHM = "HS256"
 
-SALLE_SERVICE_URL = os.getenv("SALLE_SERVICE_URL")
-if not SALLE_SERVICE_URL:
-    raise ValueError("SALLE_SERVICE_URL must be set in environment variables")
-
 logger.info(f"Using DATABASE_URL: {DATABASE_URL}")
 logger.info(f"Using KAFKA_BOOTSTRAP_SERVERS: {KAFKA_BOOTSTRAP_SERVERS}")
 logger.info(f"Using JWT_SECRET: {JWT_SECRET}")
-logger.info(f"Using SALLE_SERVICE_URL: {SALLE_SERVICE_URL}")
 
 # FastAPI app
 app = FastAPI()
 
-# Database setup
-engine = create_engine(DATABASE_URL)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-Base = declarative_base()
-
 # Kafka producer setup with retry logic
-def init_kafka_producer(bootstrap_servers, retries=20, delay=5):
+def init_kafka_producer(bootstrap_servers, retries=5, delay=10):
     for attempt in range(retries):
         try:
             producer = KafkaProducer(
                 bootstrap_servers=[bootstrap_servers],
-                value_serializer=lambda v: json.dumps(v).encode('utf-8'),
-                retries=5,
-                request_timeout_ms=10000,
-                max_block_ms=10000,
-                connections_max_idle_ms=300000
+                value_serializer=lambda v: json.dumps(v).encode('utf-8')
             )
-            producer.send('test-topic', {'test': 'connection'}).get(timeout=5)
             logger.info("Successfully connected to Kafka")
             return producer
         except Exception as e:
-            logger.warning(f"Failed to connect to Kafka (attempt {attempt + 1}/{retries}): {str(e)}")
+            logger.error(f"Failed to connect to Kafka (attempt {attempt + 1}/{retries}): {str(e)}")
             if attempt < retries - 1:
                 time.sleep(delay)
             else:
                 raise Exception(f"Failed to connect to Kafka after {retries} attempts: {str(e)}")
 
 try:
-    producer = init_kafka_producer(KAFKA_BOOTSTRAP_SERVERS)
+    producer = init_kafka_producer(KAFKA_BOOTSTRAP_SERVERS, retries=5, delay=10)
 except Exception as e:
     logger.error(f"Failed to initialize Kafka producer: {str(e)}")
     raise e
 
-# Database models
-class Reservation(Base):
-    __tablename__ = "reservations"
+# PostgreSQL connection
+def get_db_connection():
+    conn = psycopg2.connect(
+        DATABASE_URL,
+        cursor_factory=RealDictCursor
+    )
+    return conn
 
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(String, index=True)
-    room_id = Column(Integer, index=True)
-    start_time = Column(DateTime, nullable=False)
-    end_time = Column(DateTime, nullable=False)
-    purpose = Column(String, nullable=False)
-    status = Column(String, nullable=False, default="confirmed")
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-# Create the database tables
-Base.metadata.create_all(bind=engine)
-
-# Dependency to get DB session
-def get_db():
-    db = SessionLocal()
+# Create the reservations table if it doesn't exist
+def init_db():
+    conn = get_db_connection()
+    cursor = conn.cursor()
     try:
-        yield db
-    finally:
-        db.close()
-
-# Dependency to get current user from JWT token
-async def get_current_user(authorization: str = Header(...)):
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Authorization header missing")
-    
-    try:
-        token = authorization.replace("Bearer ", "")
-        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-        return payload
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS reservations (
+                id SERIAL PRIMARY KEY,
+                user_id VARCHAR(255) NOT NULL,
+                room_id INTEGER NOT NULL,
+                start_time TIMESTAMP NOT NULL,
+                end_time TIMESTAMP NOT NULL,
+                status VARCHAR(50) DEFAULT 'pending',
+                priority INTEGER,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.commit()
+        logger.info("Reservations table created or already exists")
     except Exception as e:
-        logger.error(f"Invalid token: {str(e)}")
-        raise HTTPException(status_code=401, detail="Invalid token")
+        logger.error(f"Error creating reservations table: {str(e)}")
+        raise
+    finally:
+        cursor.close()
+        conn.close()
 
-# Pydantic models for request validation
+# Initialize the database on startup
+@app.on_event("startup")
+async def startup_event():
+    init_db()
+
+# Pydantic model for creating a reservation
 class ReservationCreate(BaseModel):
     room_id: int
     start_time: datetime
     end_time: datetime
-    purpose: str
 
-class ReservationUpdate(BaseModel):
-    start_time: Optional[datetime] = None
-    end_time: Optional[datetime] = None
-    purpose: Optional[str] = None
+# Pydantic model for reservation response
+class ReservationResponse(BaseModel):
+    id: int
+    user_id: str
+    room_id: int
+    start_time: datetime
+    end_time: datetime
+    status: str
+    priority: Optional[int] = None
+    created_at: datetime
+    room_name: Optional[str] = None
 
-# Function to fetch room with retries
-def fetch_room_with_retries(room_id: int, token: str, retries=10, delay=5):
+# Pydantic models for updating status and priority
+class ReservationStatusUpdate(BaseModel):
+    status: str
+
+class ReservationPriorityUpdate(BaseModel):
+    priority: int
+
+# Pydantic model for request action payload
+class ReservationRequestUpdate(BaseModel):
+    status: str
+    priority: Optional[int] = None
+
+# Dependency to validate JWT token and return both user payload and token
+async def get_current_user(request: Request) -> Tuple[dict, str]:
+    token = request.headers.get("Authorization", "").replace("Bearer ", "")
+    if not token:
+        token = request.cookies.get("jwt_token")
+    if not token:
+        logger.error("Missing or invalid Authorization header and no jwt_token cookie")
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        logger.info(f"JWT payload: {payload}")
+        return payload, token  # Return both the decoded payload and the raw token
+    except jwt.ExpiredSignatureError:
+        logger.error("Token has expired")
+        raise HTTPException(status_code=401, detail="Token expired")
+    except jwt.InvalidTokenError as e:
+        logger.error(f"Token validation failed: {str(e)}")
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+# Fetch room details from salle-service
+async def fetch_room_details(room_id: int, token: str):
+    retries, delay = 5, 5
     for attempt in range(retries):
         try:
-            response = requests.get(
-                f"{SALLE_SERVICE_URL}/{room_id}",
-                headers={"Authorization": f"Bearer {token}"},
-                timeout=5
-            )
-            if response.status_code == 200:
+            async with httpx.AsyncClient() as client:
+                response = await client.get(
+                    f"http://salle-service:8002/rooms/{room_id}",
+                    headers={"Authorization": f"Bearer {token}"},
+                    timeout=5
+                )
+                response.raise_for_status()
                 return response.json()
-            else:
-                raise Exception(f"Unexpected status code: {response.status_code}")
-        except requests.RequestException as e:
-            logger.warning(f"Attempt {attempt + 1}/{retries} to contact salle-service failed: {str(e)}")
-            if attempt < retries - 1:
-                time.sleep(delay)
-            else:
-                logger.error(f"Failed to contact salle-service after {retries} attempts: {str(e)}")
-                raise HTTPException(status_code=503, detail="Service unavailable: Failed to verify room")
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                logger.warning(f"Room {room_id} not found in salle-service")
+                raise HTTPException(status_code=404, detail="Room not found")
+            logger.warning(f"Salle-service request retry {attempt + 1}/{retries}: {str(e)}")
+            if attempt == retries - 1:
+                logger.error(f"Error querying salle-service: {str(e)}")
+                raise HTTPException(status_code=503, detail="Failed to communicate with salle-service")
+            time.sleep(delay)
+        except Exception as e:
+            logger.warning(f"Salle-service request retry {attempt + 1}/{retries}: {str(e)}")
+            if attempt == retries - 1:
+                logger.error(f"Error querying salle-service: {str(e)}")
+                raise HTTPException(status_code=503, detail="Failed to communicate with salle-service")
+            time.sleep(delay)
+    return None
 
-# Check room availability
-def check_room_availability(room_id: int, start_time: datetime, end_time: datetime, db: Session, exclude_reservation_id: Optional[int] = None):
-    # Validate time range
-    if start_time >= end_time:
-        raise HTTPException(status_code=400, detail="End time must be after start time")
-    if start_time < datetime.utcnow():
-        raise HTTPException(status_code=400, detail="Start time cannot be in the past")
+# Check room availability by querying salle-service
+async def check_room_availability(room_id: int, start_time: datetime, end_time: datetime, token: str):
+    # Fetch room details from salle-service
+    room = await fetch_room_details(room_id, token)
 
     # Check for overlapping reservations
-    query = db.query(Reservation).filter(
-        Reservation.room_id == room_id,
-        Reservation.start_time < end_time,
-        Reservation.end_time > start_time
-    )
-    if exclude_reservation_id:
-        query = query.filter(Reservation.id != exclude_reservation_id)
-    
-    overlapping_reservations = query.all()
-    if overlapping_reservations:
-        raise HTTPException(status_code=400, detail="Room is not available for the selected time slot")
-
-    return True
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            """
+            SELECT id FROM reservations
+            WHERE room_id = %s
+            AND status = 'approved'
+            AND (
+                (start_time <= %s AND end_time >= %s) OR
+                (start_time <= %s AND end_time >= %s) OR
+                (start_time >= %s AND end_time <= %s)
+            )
+            """,
+            (
+                room_id,
+                start_time, start_time,
+                end_time, end_time,
+                start_time, end_time
+            )
+        )
+        overlapping_reservations = cursor.fetchall()
+        if overlapping_reservations:
+            logger.warning(f"Room {room_id} is already reserved for the selected time slot")
+            raise HTTPException(status_code=400, detail="Room is not available for the selected time slot")
+        return room
+    except Exception as e:
+        logger.error(f"Error checking overlapping reservations for room {room_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to check room availability")
+    finally:
+        cursor.close()
+        conn.close()
 
 # Create a reservation
-@app.post("/reservations/", response_model=dict)
-async def create_reservation(
-    reservation: ReservationCreate,
-    user: dict = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    # Verify the room exists by calling salle-service with retry logic
-    token = jwt.encode(user, JWT_SECRET, algorithm=JWT_ALGORITHM)
-    fetch_room_with_retries(reservation.room_id, token)
+@app.post("/reservations/", response_model=ReservationResponse)
+async def create_reservation(reservation: ReservationCreate, user_and_token: Tuple[dict, str] = Depends(get_current_user)):
+    user, token = user_and_token
 
-    # Check room availability
-    check_room_availability(reservation.room_id, reservation.start_time, reservation.end_time, db)
+    # Validate time range
+    if reservation.start_time >= reservation.end_time:
+        logger.error(f"Invalid time range: start_time {reservation.start_time} >= end_time {reservation.end_time}")
+        raise HTTPException(status_code=400, detail="End time must be after start time")
+    if reservation.start_time < datetime.utcnow():
+        logger.error(f"Start time {reservation.start_time} is in the past")
+        raise HTTPException(status_code=400, detail="Start time cannot be in the past")
+
+    # Check room availability and get room details
+    room = await check_room_availability(reservation.room_id, reservation.start_time, reservation.end_time, token)
 
     # Create the reservation
-    db_reservation = Reservation(
-        user_id=user["sub"],
-        room_id=reservation.room_id,
-        start_time=reservation.start_time,
-        end_time=reservation.end_time,
-        purpose=reservation.purpose,
-        status="confirmed"
-    )
-    db.add(db_reservation)
-    db.commit()
-    db.refresh(db_reservation)
-
-    # Publish reservation_created event to Kafka
-    event = {
-        "event_type": "reservation_created",
-        "reservation_id": db_reservation.id,
-        "room_id": db_reservation.room_id,
-        "user_id": user["sub"],
-        "start_time": db_reservation.start_time.isoformat(),
-        "end_time": db_reservation.end_time.isoformat(),
-        "timestamp": datetime.utcnow().isoformat()
-    }
+    conn = get_db_connection()
+    cursor = conn.cursor()
     try:
-        producer.send("reservation-events", event)
-        producer.flush()
-        logger.info(f"Published reservation_created event: {event}")
-    except Exception as e:
-        logger.error(f"Error publishing to Kafka: {str(e)}")
-        raise HTTPException(status_code=500, detail="Failed to publish event to Kafka")
+        cursor.execute(
+            """
+            INSERT INTO reservations (user_id, room_id, start_time, end_time)
+            VALUES (%s, %s, %s, %s)
+            RETURNING id, user_id, room_id, start_time, end_time, status, priority, created_at
+            """,
+            (user["sub"], reservation.room_id, reservation.start_time, reservation.end_time)
+        )
+        new_reservation = cursor.fetchone()
+        conn.commit()
 
-    return {
-        "id": db_reservation.id,
-        "user_id": db_reservation.user_id,
-        "room_id": db_reservation.room_id,
-        "start_time": db_reservation.start_time.isoformat(),
-        "end_time": db_reservation.end_time.isoformat(),
-        "purpose": db_reservation.purpose,
-        "status": db_reservation.status,
-        "created_at": db_reservation.created_at.isoformat()
-    }
+        # Publish reservation_created event to Kafka
+        reservation_event = {
+            "event_type": "reservation_created",
+            "reservation_id": new_reservation["id"],
+            "user_id": user["sub"],
+            "room_id": reservation.room_id,
+            "start_time": reservation.start_time.isoformat(),
+            "end_time": reservation.end_time.isoformat(),
+            "role": user.get("role", "unknown"),
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        try:
+            producer.send("reservation-events", reservation_event)
+            producer.flush()
+            logger.info(f"Published reservation_created event: {reservation_event}")
+        except Exception as e:
+            logger.error(f"Error publishing to Kafka: {str(e)}")
+            raise HTTPException(status_code=500, detail="Failed to publish event to Kafka")
+
+        return ReservationResponse(
+            **new_reservation,
+            room_name=room.get("name")
+        )
+    except Exception as e:
+        logger.error(f"Error creating reservation: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to create reservation")
+    finally:
+        cursor.close()
+        conn.close()
+
+# Get reservation history for the current user (or all reservations for admin)
+@app.get("/reservations/history", response_model=list[ReservationResponse])
+async def get_reservation_history(user_and_token: Tuple[dict, str] = Depends(get_current_user)):
+    user, token = user_and_token
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        if user.get("role") == "admin":
+            # Admins can see all reservations
+            cursor.execute(
+                """
+                SELECT id, user_id, room_id, start_time, end_time, status, priority, created_at
+                FROM reservations
+                ORDER BY created_at DESC
+                """
+            )
+        else:
+            # Regular users see only their reservations
+            cursor.execute(
+                """
+                SELECT id, user_id, room_id, start_time, end_time, status, priority, created_at
+                FROM reservations
+                WHERE user_id = %s
+                ORDER BY created_at DESC
+                """,
+                (user["sub"],)
+            )
+        reservations = cursor.fetchall()
+
+        # Fetch room details from salle-service
+        enriched_reservations = []
+        for reservation in reservations:
+            room = await fetch_room_details(reservation["room_id"], token)
+            reservation["room_name"] = room.get("name") if room else "Unknown Room"
+            enriched_reservations.append(ReservationResponse(**reservation))
+
+        return enriched_reservations
+    except Exception as e:
+        logger.error(f"Error fetching reservation history for user {user['sub']}: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to fetch reservation history")
+    finally:
+        cursor.close()
+        conn.close()
 
 # Get all reservations for the authenticated user
-@app.get("/reservations/", response_model=List[dict])
-async def get_reservations(user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
-    reservations = db.query(Reservation).filter(Reservation.user_id == user["sub"]).order_by(Reservation.start_time.desc()).all()
-    return [
-        {
-            "id": r.id,
-            "user_id": r.user_id,
-            "room_id": r.room_id,
-            "start_time": r.start_time.isoformat(),
-            "end_time": r.end_time.isoformat(),
-            "purpose": r.purpose,
-            "status": r.status,
-            "created_at": r.created_at.isoformat()
-        }
-        for r in reservations
-    ]
+@app.get("/reservations/", response_model=list[ReservationResponse])
+async def get_reservations(user_and_token: Tuple[dict, str] = Depends(get_current_user)):
+    user, token = user_and_token
 
-# Get a specific reservation
-@app.get("/reservations/{reservation_id}", response_model=dict)
-async def get_reservation(reservation_id: int, user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
-    reservation = db.query(Reservation).filter(
-        Reservation.id == reservation_id,
-        Reservation.user_id == user["sub"]
-    ).first()
-    if not reservation:
-        raise HTTPException(status_code=404, detail="Reservation not found or not authorized")
-    
-    return {
-        "id": reservation.id,
-        "user_id": reservation.user_id,
-        "room_id": reservation.room_id,
-        "start_time": reservation.start_time.isoformat(),
-        "end_time": reservation.end_time.isoformat(),
-        "purpose": reservation.purpose,
-        "status": reservation.status,
-        "created_at": reservation.created_at.isoformat()
-    }
-
-# Update a reservation
-@app.put("/reservations/{reservation_id}", response_model=dict)
-async def update_reservation(
-    reservation_id: int,
-    reservation_update: ReservationUpdate,
-    user: dict = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    # Fetch the existing reservation
-    reservation = db.query(Reservation).filter(
-        Reservation.id == reservation_id,
-        Reservation.user_id == user["sub"]
-    ).first()
-    if not reservation:
-        raise HTTPException(status_code=404, detail="Reservation not found or not authorized")
-
-    # Prepare updated values
-    update_data = reservation_update.dict(exclude_unset=True)
-    if not update_data:
-        raise HTTPException(status_code=400, detail="No fields to update")
-
-    # Check availability if time fields are updated
-    new_start_time = update_data.get("start_time", reservation.start_time)
-    new_end_time = update_data.get("end_time", reservation.end_time)
-    if "start_time" in update_data or "end_time" in update_data:
-        check_room_availability(reservation.room_id, new_start_time, new_end_time, db, exclude_reservation_id=reservation_id)
-
-    # Update the reservation
-    for key, value in update_data.items():
-        setattr(reservation, key, value)
-    
-    db.commit()
-    db.refresh(reservation)
-
-    # Publish reservation_updated event to Kafka
-    event = {
-        "event_type": "reservation_updated",
-        "reservation_id": reservation.id,
-        "room_id": reservation.room_id,
-        "user_id": user["sub"],
-        "start_time": reservation.start_time.isoformat(),
-        "end_time": reservation.end_time.isoformat(),
-        "timestamp": datetime.utcnow().isoformat()
-    }
+    conn = get_db_connection()
+    cursor = conn.cursor()
     try:
-        producer.send("reservation-events", event)
-        producer.flush()
-        logger.info(f"Published reservation_updated event: {event}")
-    except Exception as e:
-        logger.error(f"Error publishing to Kafka: {str(e)}")
-        raise HTTPException(status_code=500, detail="Failed to publish event to Kafka")
+        cursor.execute(
+            """
+            SELECT id, user_id, room_id, start_time, end_time, status, priority, created_at
+            FROM reservations
+            WHERE user_id = %s
+            ORDER BY created_at DESC
+            """,
+            (user["sub"],)
+        )
+        reservations = cursor.fetchall()
 
-    return {
-        "id": reservation.id,
-        "user_id": reservation.user_id,
-        "room_id": reservation.room_id,
-        "start_time": reservation.start_time.isoformat(),
-        "end_time": reservation.end_time.isoformat(),
-        "purpose": reservation.purpose,
-        "status": reservation.status,
-        "created_at": reservation.created_at.isoformat()
-    }
+        # Fetch room details from salle-service
+        enriched_reservations = []
+        for reservation in reservations:
+            room = await fetch_room_details(reservation["room_id"], token)
+            reservation["room_name"] = room.get("name") if room else "Unknown Room"
+            enriched_reservations.append(ReservationResponse(**reservation))
+
+        return enriched_reservations
+    except Exception as e:
+        logger.error(f"Error fetching reservations for user {user['sub']}: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to fetch reservations")
+    finally:
+        cursor.close()
+        conn.close()
 
 # Delete a reservation
 @app.delete("/reservations/{reservation_id}", response_model=dict)
-async def delete_reservation(reservation_id: int, user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
-    reservation = db.query(Reservation).filter(
-        Reservation.id == reservation_id,
-        Reservation.user_id == user["sub"]
-    ).first()
-    if not reservation:
-        raise HTTPException(status_code=404, detail="Reservation not found or not authorized")
+async def delete_reservation(reservation_id: int, user_and_token: Tuple[dict, str] = Depends(get_current_user)):
+    user, _ = user_and_token  # We don't need the token for this endpoint
 
-    # Update status to 'cancelled' instead of deleting
-    reservation.status = "cancelled"
-    db.commit()
-    db.refresh(reservation)
-
-    # Publish reservation_cancelled event to Kafka
-    event = {
-        "event_type": "reservation_cancelled",
-        "reservation_id": reservation.id,
-        "room_id": reservation.room_id,
-        "user_id": user["sub"],
-        "timestamp": datetime.utcnow().isoformat()
-    }
+    conn = get_db_connection()
+    cursor = conn.cursor()
     try:
-        producer.send("reservation-events", event)
-        producer.flush()
-        logger.info(f"Published reservation_cancelled event: {event}")
-    except Exception as e:
-        logger.error(f"Error publishing to Kafka: {str(e)}")
-        raise HTTPException(status_code=500, detail="Failed to publish event to Kafka")
+        # Check if the reservation exists and belongs to the user
+        cursor.execute(
+            "SELECT id, user_id, room_id, start_time, end_time FROM reservations WHERE id = %s",
+            (reservation_id,)
+        )
+        reservation = cursor.fetchone()
+        if not reservation:
+            logger.warning(f"Reservation {reservation_id} not found")
+            raise HTTPException(status_code=404, detail="Reservation not found")
+        if reservation["user_id"] != user["sub"] and user.get("role") != "admin":
+            logger.error(f"User {user['sub']} attempted to delete reservation {reservation_id} they do not own")
+            raise HTTPException(status_code=403, detail="Not authorized to delete this reservation")
 
-    return {"message": f"Reservation {reservation_id} cancelled"}
+        # Delete the reservation
+        cursor.execute("DELETE FROM reservations WHERE id = %s", (reservation_id,))
+        conn.commit()
+
+        # Publish reservation_deleted event to Kafka
+        reservation_event = {
+            "event_type": "reservation_deleted",
+            "reservation_id": reservation_id,
+            "user_id": user["sub"],
+            "room_id": reservation["room_id"],
+            "start_time": reservation["start_time"].isoformat(),
+            "end_time": reservation["end_time"].isoformat(),
+            "role": user.get("role", "unknown"),
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        try:
+            producer.send("reservation-events", reservation_event)
+            producer.flush()
+            logger.info(f"Published reservation_deleted event: {reservation_event}")
+        except Exception as e:
+            logger.error(f"Error publishing to Kafka: {str(e)}")
+            raise HTTPException(status_code=500, detail="Failed to publish event to Kafka")
+
+        return {"message": "Reservation deleted successfully"}
+    except Exception as e:
+        logger.error(f"Error deleting reservation {reservation_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to delete reservation")
+    finally:
+        cursor.close()
+        conn.close()
+
+# Get pending reservations (employee only)
+@app.get("/reservations/pending", response_model=list[ReservationResponse])
+async def get_pending_reservations(user_and_token: Tuple[dict, str] = Depends(get_current_user)):
+    user, token = user_and_token
+    if user.get("role") != "employee":
+        raise HTTPException(status_code=403, detail="Employee access required")
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            """
+            SELECT id, user_id, room_id, start_time, end_time, status, priority, created_at
+            FROM reservations
+            WHERE status = 'pending'
+            ORDER BY created_at DESC
+            """
+        )
+        reservations = cursor.fetchall()
+
+        enriched_reservations = []
+        for reservation in reservations:
+            room = await fetch_room_details(reservation["room_id"], token)
+            reservation["room_name"] = room.get("name") if room else "Unknown Room"
+            enriched_reservations.append(ReservationResponse(**reservation))
+
+        return enriched_reservations
+    except Exception as e:
+        logger.error(f"Error fetching pending reservations: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to fetch pending reservations")
+    finally:
+        cursor.close()
+        conn.close()
+
+# Handle reservation request (accept/refuse) with status and priority (employee only)
+@app.post("/reservations/request/{reservation_id}/{action}")
+async def handle_reservation_request(
+    reservation_id: int,
+    action: str,
+    update: ReservationRequestUpdate,
+    user_and_token: Tuple[dict, str] = Depends(get_current_user)
+):
+    user, _ = user_and_token
+    if user.get("role") != "employee":
+        raise HTTPException(status_code=403, detail="Employee access required")
+    if action not in ["accept", "refuse"]:
+        raise HTTPException(status_code=400, detail="Invalid action")
+
+    new_status = update.status
+    priority = update.priority if action == "accept" else None
+
+    if new_status not in ["approved", "denied"]:
+        raise HTTPException(status_code=400, detail="Invalid status")
+    if priority and (priority < 1 or priority > 3):
+        raise HTTPException(status_code=400, detail="Priority must be between 1 and 3")
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            """
+            UPDATE reservations
+            SET status = %s, priority = %s
+            WHERE id = %s AND status = 'pending'
+            RETURNING id, user_id, room_id, start_time, end_time
+            """,
+            (new_status, priority, reservation_id)
+        )
+        updated_reservation = cursor.fetchone()
+        if not updated_reservation:
+            raise HTTPException(status_code=404, detail="Reservation not found or not pending")
+        conn.commit()
+
+        reservation_event = {
+            "event_type": f"reservation_{new_status}",
+            "reservation_id": reservation_id,
+            "user_id": updated_reservation["user_id"],
+            "room_id": updated_reservation["room_id"],
+            "start_time": updated_reservation["start_time"].isoformat(),
+            "end_time": updated_reservation["end_time"].isoformat(),
+            "handled_by": user["sub"],
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        if priority:
+            reservation_event["priority"] = priority
+
+        try:
+            producer.send("reservation-events", reservation_event)
+            producer.flush()
+            logger.info(f"Published reservation_{new_status} event: {reservation_event}")
+        except Exception as e:
+            logger.error(f"Error publishing to Kafka: {str(e)}")
+            raise HTTPException(status_code=500, detail="Failed to publish event to Kafka")
+
+        return {"message": f"Reservation {action}ed successfully"}
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"Error handling reservation request: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to handle reservation request")
+    finally:
+        cursor.close()
+        conn.close()
+
+# Update reservation status (admin only)
+@app.put("/reservations/{reservation_id}/status")
+async def update_reservation_status(
+    reservation_id: int,
+    update: ReservationStatusUpdate,
+    user_and_token: Tuple[dict, str] = Depends(get_current_user)
+):
+    user, _ = user_and_token  # We don't need the token for this endpoint
+
+    if user.get("role") != "admin":
+        logger.error(f"User {user['sub']} attempted to update reservation status without admin privileges")
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    if update.status not in ["pending", "approved", "denied"]:
+        raise HTTPException(status_code=400, detail="Invalid status")
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            """
+            UPDATE reservations
+            SET status = %s
+            WHERE id = %s
+            RETURNING id, user_id, room_id, start_time, end_time
+            """,
+            (update.status, reservation_id)
+        )
+        updated_reservation = cursor.fetchone()
+        if not updated_reservation:
+            raise HTTPException(status_code=404, detail="Reservation not found")
+        conn.commit()
+
+        # Publish reservation_status_updated event to Kafka
+        reservation_event = {
+            "event_type": "reservation_status_updated",
+            "reservation_id": reservation_id,
+            "user_id": updated_reservation["user_id"],
+            "room_id": updated_reservation["room_id"],
+            "start_time": updated_reservation["start_time"].isoformat(),
+            "end_time": updated_reservation["end_time"].isoformat(),
+            "status": update.status,
+            "updated_by": user["sub"],
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        try:
+            producer.send("reservation-events", reservation_event)
+            producer.flush()
+            logger.info(f"Published reservation_status_updated event: {reservation_event}")
+        except Exception as e:
+            logger.error(f"Error publishing to Kafka: {str(e)}")
+            raise HTTPException(status_code=500, detail="Failed to publish event to Kafka")
+
+        return {"message": "Reservation status updated"}
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"Error updating reservation status: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to update reservation status")
+    finally:
+        cursor.close()
+        conn.close()
+
+# Update reservation priority (admin only)
+@app.put("/reservations/{reservation_id}/priority")
+async def update_reservation_priority(
+    reservation_id: int,
+    update: ReservationPriorityUpdate,
+    user_and_token: Tuple[dict, str] = Depends(get_current_user)
+):
+    user, _ = user_and_token  # We don't need the token for this endpoint
+
+    if user.get("role") != "admin":
+        logger.error(f"User {user['sub']} attempted to update reservation priority without admin privileges")
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    if update.priority < 1 or update.priority > 3:
+        raise HTTPException(status_code=400, detail="Priority must be between 1 and 3")
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            """
+            UPDATE reservations
+            SET priority = %s
+            WHERE id = %s
+            RETURNING id, user_id, room_id, start_time, end_time
+            """,
+            (update.priority, reservation_id)
+        )
+        updated_reservation = cursor.fetchone()
+        if not updated_reservation:
+            raise HTTPException(status_code=404, detail="Reservation not found")
+        conn.commit()
+
+        # Publish reservation_priority_updated event to Kafka
+        reservation_event = {
+            "event_type": "reservation_priority_updated",
+            "reservation_id": reservation_id,
+            "user_id": updated_reservation["user_id"],
+            "room_id": updated_reservation["room_id"],
+            "start_time": updated_reservation["start_time"].isoformat(),
+            "end_time": updated_reservation["end_time"].isoformat(),
+            "priority": update.priority,
+            "updated_by": user["sub"],
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        try:
+            producer.send("reservation-events", reservation_event)
+            producer.flush()
+            logger.info(f"Published reservation_priority_updated event: {reservation_event}")
+        except Exception as e:
+            logger.error(f"Error publishing to Kafka: {str(e)}")
+            raise HTTPException(status_code=500, detail="Failed to publish event to Kafka")
+
+        return {"message": "Reservation priority updated"}
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"Error updating reservation priority: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to update reservation priority")
+    finally:
+        cursor.close()
+        conn.close()
 
 # Health check endpoint
 @app.get("/health")
@@ -375,10 +652,12 @@ async def health_check():
     # Check database connectivity
     for attempt in range(retries):
         try:
-            db = SessionLocal()
-            db.execute("SELECT 1")
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute("SELECT 1")
             health_status["details"]["database"] = "healthy"
-            db.close()
+            cursor.close()
+            conn.close()
             break
         except Exception as e:
             logger.warning(f"Database health check retry {attempt + 1}/{retries}: {str(e)}")
@@ -403,19 +682,18 @@ async def health_check():
                 health_status["status"] = "unhealthy"
             time.sleep(delay)
 
-    # Check salle-service connectivity via API Gateway
+    # Check salle-service connectivity
     for attempt in range(retries):
         try:
-            response = requests.get(SALLE_SERVICE_URL, timeout=5)
-            if response.status_code == 200:
+            async with httpx.AsyncClient() as client:
+                response = await client.get("http://salle-service:8002/health", timeout=5)
+                response.raise_for_status()
                 health_status["details"]["salle_service"] = "healthy"
                 break
-            else:
-                raise Exception(f"Unexpected status code: {response.status_code}")
         except Exception as e:
-            logger.warning(f"Salle service health check retry {attempt + 1}/{retries}: {str(e)}")
+            logger.warning(f"Salle-service health check retry {attempt + 1}/{retries}: {str(e)}")
             if attempt == retries - 1:
-                logger.error(f"Salle service health check failed: {str(e)}")
+                logger.error(f"Salle-service health check failed: {str(e)}")
                 health_status["details"]["salle_service"] = f"unhealthy: {str(e)}"
                 health_status["status"] = "unhealthy"
             time.sleep(delay)

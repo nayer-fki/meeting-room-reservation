@@ -1,0 +1,40 @@
+/* frontend/src/components/users/UserList.css */
+.user-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+  gap: 1.5rem;
+}
+
+.user-card {
+  background-color: #fff;
+  padding: 1rem;
+  border-radius: 0.5rem;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+  transition: box-shadow 0.3s ease;
+}
+
+.user-card:hover {
+  box-shadow: 0 4px 8px rgba(0, 0, 0, 0.15);
+}
+
+.user-name {
+  font-size: 1.25rem;
+  color: #2d3748;
+  margin-bottom: 0.5rem;
+  font-weight: 500;
+}
+
+.user-email {
+  color: #4a5568;
+  margin-bottom: 0.25rem;
+}
+
+.user-role {
+  color: #718096;
+  font-size: 0.9rem;
+}
+
+.no-data {
+  color: #718096;
+  font-style: italic;
+}
